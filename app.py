@@ -228,9 +228,9 @@ if "schedule" in st.session_state:
     schedule = st.session_state["schedule"]
     summary = st.session_state["summary"]
     st.subheader("Jadwal")
-    st.table(schedule[["Tanggal", "Jaga", "Review", "ERM"]], use_container_width=True, hide_index=True)
+    st.table(schedule[["Tanggal", "Jaga", "Review", "ERM"]], )
     st.subheader("Ringkasan fairness Jaga")
-    st.table(summary.sort_values("Nama"), use_container_width=True, hide_index=True)
+    st.table(summary.sort_values("Nama"), )
     word_file = schedule_docx(schedule, summary, st.session_state["start"], st.session_state["end"])
     st.download_button("Unduh jadwal Word", word_file, "jadwal-angkatan-15.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
     st.success("Jadwal tervalidasi: semua anggota mendapat porsi Jaga yang setara (selisih maksimal satu) dan tidak ada tiga Jaga berturut-turut.")
