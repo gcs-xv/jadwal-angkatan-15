@@ -3,6 +3,7 @@ import json
 import random
 import re
 import csv
+import calendar
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
 from difflib import get_close_matches
@@ -267,6 +268,38 @@ def save_monthly_roster(month_key, roster, config):
         return f"Roster belum tersimpan: {message}"
 
 
+def load_daily_assignment(assignment_date):
+    client, error = database()
+    if error:
+        return None, error
+    try:
+        response = client.table("daily_assignments").select("assignment, assignment_text, updated_at").eq("assignment_date", assignment_date).execute()
+        data = response.data or []
+        return (data[0] if data else None), None
+    except Exception as error:
+        message = str(error)
+        if "daily_assignments" in message or "404" in message:
+            return None, "Tabel pembagian belum dibuat di Supabase. Jalankan SQL `daily_assignments` yang disediakan bersama update ini."
+        return None, f"Pembagian belum dapat dibaca: {message}"
+
+
+def save_daily_assignment(month_key, assignment_date, assignment, assignment_text):
+    client, error = database()
+    if error:
+        return error
+    try:
+        client.table("daily_assignments").upsert({
+            "assignment_date": assignment_date,
+            "roster_month": month_key,
+            "assignment": assignment,
+            "assignment_text": assignment_text,
+            "updated_at": datetime.utcnow().isoformat(),
+        }, on_conflict="assignment_date").execute()
+        return None
+    except Exception as error:
+        return f"Pembagian belum tersimpan: {error}"
+
+
 def reset_month_state(month_key):
     stored, error = load_monthly_roster(month_key)
     st.session_state.active_roster_month = month_key
@@ -300,6 +333,250 @@ def admin_access():
             else:
                 st.error("Password admin salah.")
     return False
+
+
+def split_residents(value):
+    return [name.strip() for name in re.split(r"[,|\n]", str(value or "")) if name.strip()]
+
+
+def active_daily_roster(row, config):
+    result = {}
+    for _, cohort in config.iterrows():
+        code = str(cohort.get("Kolom", "")).strip().lower()
+        if code and bool(cohort.get("Aktif", True)):
+            result[code] = split_residents(row.get(code, ""))
+    return result
+
+
+def stable_shuffle(values, assignment_date, salt):
+    values = list(values)
+    random.Random(f"{assignment_date}:{salt}").shuffle(values)
+    return values
+
+
+def distribute_patients(residents, count, assignment_date, salt):
+    teams = [[] for _ in range(count)]
+    if not residents or not count:
+        return teams
+    for index, name in enumerate(stable_shuffle(residents, assignment_date, salt)):
+        teams[index % count].append(name)
+    return teams
+
+
+def distribute_roles(residents, patient_count, roles, assignment_date, salt):
+    result = [{role: [] for role in roles} for _ in range(patient_count)]
+    if not residents or not patient_count:
+        return result
+    slots = [(patient_index, role) for patient_index in range(patient_count) for role in roles]
+    slots = stable_shuffle(slots, assignment_date, f"{salt}:slots")
+    people = stable_shuffle(residents, assignment_date, f"{salt}:people")
+    if len(people) >= len(slots):
+        slots = (slots * (len(people) // len(slots))) + slots[:len(people) % len(slots)]
+    for index, slot in enumerate(slots):
+        patient_index, role = slot
+        result[patient_index][role].append(people[index % len(people)])
+    return result
+
+
+def parse_patient_lines(value, post_op=False):
+    patients = []
+    for line in str(value or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        name, separator, meta = line.partition("|")
+        patients.append({"name": name.strip(), "meta": meta.strip() if separator and post_op else ""})
+    return patients
+
+
+def pod_labels(meta):
+    meta = (meta or "").strip()
+    if meta:
+        return (meta, f"{meta} + 1")
+    return ("POD I", "POD II")
+
+
+def cohort_label_map(config):
+    return {str(row["Kolom"]).lower(): str(row["Label angkatan"]) for _, row in config.iterrows()}
+
+
+def sort_names_by_cohort(names, roster, cohort_codes):
+    order = {code: index for index, code in enumerate(cohort_codes)}
+    membership = {name: code for code, members in roster.items() for name in members}
+    return sorted(dict.fromkeys(names), key=lambda name: (order.get(membership.get(name, ""), 999), name.lower()))
+
+
+def build_daily_assignment(roster, assignment_date, post_ops, pre_ops, igds, pilot, copilot, erm, review):
+    """Generic version of the legacy cohort-by-cohort assignment theorem."""
+    codes = list(roster)
+    post_assignment = []
+    if len(post_ops) == 1:
+        first, second = [], []
+        for code in codes:
+            members = stable_shuffle(roster[code], assignment_date, f"post:{code}")
+            pivot = (len(members) + 1) // 2
+            first.extend(members[:pivot])
+            second.extend(members[pivot:])
+        labels = pod_labels(post_ops[0].get("meta"))
+        post_assignment.append({"name": post_ops[0]["name"], "pod_lines": [
+            {"label": labels[0], "team": sort_names_by_cohort(first, roster, codes)},
+            {"label": labels[1], "team": sort_names_by_cohort(second, roster, codes)},
+        ]})
+    elif post_ops:
+        teams = [[] for _ in post_ops]
+        for code in codes:
+            for index, team in enumerate(distribute_patients(roster[code], len(post_ops), assignment_date, f"post:{code}")):
+                teams[index].extend(team)
+        for index, patient in enumerate(post_ops):
+            labels = pod_labels(patient.get("meta"))
+            team = sort_names_by_cohort(teams[index], roster, codes)
+            post_assignment.append({"name": patient["name"], "pod_lines": [{"label": labels[0], "team": team}, {"label": labels[1], "team": team}]})
+
+    def build_role_section(patients, final_role, salt):
+        roles = ["soap", "rm", "erm", final_role]
+        section = [{"name": patient["name"], "soap": [], "rm_erm": [], final_role: []} for patient in patients]
+        for code in codes:
+            allocation = distribute_roles(roster[code], len(patients), roles, assignment_date, f"{salt}:{code}")
+            for index, roles_for_patient in enumerate(allocation):
+                for role, names in roles_for_patient.items():
+                    target_role = "rm_erm" if role in ("rm", "erm") else role
+                    section[index][target_role].extend(names)
+        for entry in section:
+            for role in ("soap", "rm_erm", final_role):
+                entry[role] = sort_names_by_cohort(entry[role], roster, codes)
+        return section
+
+    pre_assignment = build_role_section(pre_ops, "tsr", "pre")
+    igd_assignment = build_role_section(igds, "er", "igd")
+    return {
+        "date": assignment_date,
+        "day_name": DAY_NAMES[datetime.strptime(assignment_date, "%Y-%m-%d").weekday()],
+        "pilot": pilot,
+        "copilot": copilot,
+        "erm_manual": erm,
+        "review_manual": review,
+        "post_op": post_assignment,
+        "pre_op": pre_assignment,
+        "igd": igd_assignment,
+    }
+
+
+def assignment_text(assignment, labels):
+    current = datetime.strptime(assignment["date"], "%Y-%m-%d")
+    lines = [f"PEMBAGIAN TUGAS JAGA — {assignment['day_name'].upper()}, {current:%d/%m/%Y}", "", f"Pilot : {assignment['pilot']}", f"Co-Pilot : {assignment['copilot']}", ""]
+    if assignment["post_op"]:
+        lines.append("POST-OP")
+        for index, patient in enumerate(assignment["post_op"], start=1):
+            lines.append(f"{index}. {patient['name']}")
+            for pod in patient["pod_lines"]:
+                lines.append(f"   {pod['label']} : {', '.join(pod['team'])}")
+        lines.append("")
+    for title, section, last_role in (("PRE-OP", assignment["pre_op"], "TSR"), ("IGD", assignment["igd"], "ER")):
+        if section:
+            lines.append(title)
+            for index, patient in enumerate(section, start=1):
+                lines += [f"{index}. {patient['name']}", f"   SOAP : {', '.join(patient['soap'])}", f"   RM/ERM : {', '.join(patient['rm_erm'])}", f"   {last_role} : {', '.join(patient[last_role.lower()])}"]
+            lines.append("")
+    lines += [f"ERM : {assignment['erm_manual']}", f"Review : {assignment['review_manual']}"]
+    return "\n".join(lines)
+
+
+def date_button_grid(available_dates):
+    available = {str(value) for value in available_dates}
+    reference = datetime.strptime(sorted(available)[0], "%Y-%m-%d").date()
+    current = st.session_state.get("selected_assignment_date")
+    if current not in available:
+        current = sorted(available)[0]
+        st.session_state.selected_assignment_date = current
+    st.markdown("<div class='panel'><b>Pilih tanggal pembagian</b><br><span style='color:#60717d'>Klik tanggal dengan roster yang tersedia.</span></div>", unsafe_allow_html=True)
+    for column, name in zip(st.columns(7), DAY_NAMES):
+        column.caption(name[:3])
+    for week in calendar.monthcalendar(reference.year, reference.month):
+        columns = st.columns(7)
+        for weekday, day_number in enumerate(week):
+            if not day_number:
+                columns[weekday].write("")
+                continue
+            iso_date = date(reference.year, reference.month, day_number).isoformat()
+            if iso_date in available:
+                active = iso_date == current
+                if columns[weekday].button(str(day_number), key=f"assignment_day_{iso_date}", type="primary" if active else "secondary", use_container_width=True):
+                    st.session_state.selected_assignment_date = iso_date
+                    st.rerun()
+            else:
+                columns[weekday].button(str(day_number), key=f"missing_day_{iso_date}", disabled=True, use_container_width=True)
+    return st.session_state.selected_assignment_date
+
+
+def render_assignment_workspace(parsed, config, month_key, is_admin):
+    available_dates = parsed["Tanggal"].dropna().astype(str).tolist()
+    if not available_dates:
+        return
+    selected_date = date_button_grid(available_dates)
+    row = parsed.loc[parsed["Tanggal"].astype(str) == selected_date].iloc[0]
+    roster = active_daily_roster(row, config)
+    labels = cohort_label_map(config)
+    all_names = [name for code in roster for name in roster[code]]
+    all_names = list(dict.fromkeys(all_names))
+    readable_date = datetime.strptime(selected_date, "%Y-%m-%d").strftime("%d %B %Y")
+    st.markdown(f"## Pembagian Tanggal {readable_date}")
+    st.caption(f"DPJP: {row.get('DPJP', '-') or '-'} · {len(all_names)} residen tersedia")
+
+    saved, database_error = load_daily_assignment(selected_date)
+    if database_error:
+        st.warning(database_error)
+    if saved:
+        st.markdown("<div class='panel'><b>Pembagian tersimpan</b><br><span style='color:#60717d'>Versi ini dapat diakses kembali setiap kali tanggal tersebut dibuka.</span></div>", unsafe_allow_html=True)
+        st.code(saved.get("assignment_text", ""), language=None)
+        if not is_admin:
+            return
+    elif not is_admin:
+        st.info("Belum ada pembagian tersimpan untuk tanggal ini.")
+        return
+
+    if not is_admin:
+        return
+    st.markdown("<div class='panel'><b>Buat atau bagi ulang</b><br><span style='color:#60717d'>Algoritme membagi setiap angkatan secara proporsional pada Post-op, Pre-op, dan IGD.</span></div>", unsafe_allow_html=True)
+    default_person = all_names[0] if all_names else ""
+    one, two, three, four = st.columns(4)
+    with one:
+        pilot = st.selectbox("Pilot", ["", *all_names], index=1 if default_person else 0, key=f"pilot_{selected_date}")
+    with two:
+        copilot_options = ["", *[name for name in all_names if name != pilot]]
+        copilot = st.selectbox("Co-pilot", copilot_options, index=1 if len(copilot_options) > 1 else 0, key=f"copilot_{selected_date}")
+    with three:
+        erm = st.selectbox("ERM", ["", *all_names], key=f"erm_{selected_date}")
+    with four:
+        review = st.selectbox("Review", ["", *all_names], key=f"review_{selected_date}")
+    post_col, pre_col, igd_col = st.columns(3)
+    with post_col:
+        post_text = st.text_area("Post-op", placeholder="Nama pasien | POD I\nSatu pasien per baris", height=150, key=f"post_{selected_date}")
+    with pre_col:
+        pre_text = st.text_area("Pre-op", placeholder="Nama pasien\nSatu pasien per baris", height=150, key=f"pre_{selected_date}")
+    with igd_col:
+        igd_text = st.text_area("IGD", placeholder="Nama pasien\nSatu pasien per baris", height=150, key=f"igd_{selected_date}")
+    if st.button("Buat pembagian otomatis", type="primary", key=f"generate_assignment_{selected_date}"):
+        assignment = build_daily_assignment(
+            roster, selected_date, parse_patient_lines(post_text, post_op=True), parse_patient_lines(pre_text), parse_patient_lines(igd_text), pilot, copilot, erm, review,
+        )
+        st.session_state.assignment_draft = assignment
+        st.session_state.assignment_draft_date = selected_date
+
+    draft = st.session_state.get("assignment_draft") if st.session_state.get("assignment_draft_date") == selected_date else None
+    assignment_to_edit = draft or (saved or {}).get("assignment")
+    if assignment_to_edit:
+        initial_text = assignment_text(assignment_to_edit, labels)
+        st.markdown("<div class='panel'><b>Pratinjau pembagian</b><br><span style='color:#60717d'>Ubah teks bila ada pembagian manual, lalu simpan. Teks tersimpan menjadi pembagian resmi untuk tanggal ini.</span></div>", unsafe_allow_html=True)
+        with st.form(f"assignment_save_form_{selected_date}", border=False):
+            manual_text = st.text_area("Pembagian tanggal terpilih", value=(saved or {}).get("assignment_text", initial_text) if not draft else initial_text, height=440, key=f"assignment_text_{selected_date}")
+            save_assignment = st.form_submit_button("Simpan pembagian tanggal ini", type="primary", use_container_width=True)
+        if save_assignment:
+            error = save_daily_assignment(month_key, selected_date, assignment_to_edit, manual_text)
+            if error:
+                st.error(error)
+            else:
+                st.session_state.assignment_draft = None
+                st.success(f"Pembagian {readable_date} tersimpan dan dapat dibuka kembali.")
 
 
 def render_roster_intake():
@@ -385,6 +662,8 @@ def render_roster_intake():
     metrics[1].metric("Angkatan aktif", len(labels))
     metrics[2].metric("Butuh koreksi", len(st.session_state.get("roster_skipped", [])))
     st.caption("Roster ini adalah sumber pembagian Post-op, Pre-op, dan IGD. Pilot dan Co-pilot akan dipilih dari kelompok yang tersedia saat pembagian, bukan dibaca dari paste. Pengguna biasa tidak dapat mengubah roster.")
+    st.divider()
+    render_assignment_workspace(st.session_state.parsed_roster, config, month_key, is_admin)
 
 
 def init_state():
@@ -583,24 +862,28 @@ def schedule_docx(schedule, summary, start, end):
 init_state()
 st.markdown("""<style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@500;600;700;800&display=swap');
-:root { --ink:#152a38; --muted:#60717d; --line:#dce5e7; --teal:#0b766e; --teal-dark:#075b55; --mint:#e9f5f2; --paper:#f7faf9; }
+:root { --ink:#102b38; --muted:#5e727d; --line:#d5e1e2; --teal:#08756d; --teal-dark:#075a55; --mint:#e8f4f1; --paper:#f5f8f7; --gold:#b98a2d; }
 .stApp { background:var(--paper); color:var(--ink); font-family:'DM Sans','Helvetica Neue',Arial,sans-serif; }
-.block-container { max-width:1180px; padding-top:2.5rem; padding-bottom:4rem; }
+.block-container { max-width:1240px; padding-top:2.2rem; padding-bottom:4.5rem; }
 h1,h2,h3,[data-testid='stMetricLabel'] { font-family:'Manrope','Helvetica Neue',Arial,sans-serif; color:var(--ink); letter-spacing:-.035em; }
-.masthead { border-bottom:1px solid var(--line); padding:0 0 1.85rem; margin-bottom:1.55rem; }
-.masthead h1 { margin:.25rem 0 .3rem; font-size:2rem; font-weight:800; }
+.masthead { position:relative; border-bottom:1px solid var(--line); padding:0 0 1.85rem; margin-bottom:1.55rem; }
+.masthead:after { content:''; position:absolute; left:0; bottom:-1px; width:112px; height:3px; background:var(--teal); }
+.masthead h1 { margin:.25rem 0 .3rem; font-size:2.2rem; font-weight:800; }
 .masthead p { color:var(--muted); max-width:700px; margin:0; font-size:.96rem; }
-.service-line { color:var(--teal); font-family:'Manrope',sans-serif; font-size:.72rem; letter-spacing:.12em; font-weight:800; }
-.panel { background:#fff; border:1px solid var(--line); border-radius:10px; padding:1.1rem 1.2rem; margin:.8rem 0 1rem; }
+.service-line { color:var(--teal); font-family:'Manrope',sans-serif; font-size:.72rem; letter-spacing:.14em; font-weight:800; }
+.panel { background:#fff; border:1px solid var(--line); border-radius:12px; padding:1.08rem 1.2rem; margin:.8rem 0 1rem; box-shadow:0 1px 1px rgba(16,43,56,.02); }
 .panel b { font-family:'Manrope',sans-serif; font-size:.95rem; }
-[data-testid='stMetric'] { background:#fff; border:1px solid var(--line); border-radius:10px; padding:1rem; box-shadow:none; }
+[data-testid='stMetric'] { background:#fff; border:1px solid var(--line); border-radius:12px; padding:1rem; box-shadow:none; }
 [data-testid='stMetricValue'] { color:var(--teal-dark); font-family:'Manrope',sans-serif; }
-div.stButton > button { border-radius:7px; font-family:'DM Sans',sans-serif; font-weight:700; min-height:2.55rem; box-shadow:none; }
+div.stButton > button { border-radius:8px; font-family:'DM Sans',sans-serif; font-weight:700; min-height:2.55rem; box-shadow:none; border-color:#b9ccce; }
 div.stButton > button[kind='primary'] { background:var(--teal); border-color:var(--teal); }
 div.stButton > button[kind='primary']:hover { background:var(--teal-dark); border-color:var(--teal-dark); }
 div[data-testid='stTabs'] button { font-family:'Manrope',sans-serif; font-size:.88rem; }
-div[data-testid='stExpander'] { background:#fff; border:1px solid var(--line); border-radius:10px; }
-div[data-testid='stDataFrame'] { border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+div[data-testid='stExpander'], div[data-testid='stForm'] { background:#fff; border:1px solid var(--line); border-radius:12px; }
+div[data-testid='stDataFrame'] { border:1px solid var(--line); border-radius:12px; overflow:hidden; }
+div[role='radiogroup'] { background:#e7efee; border-radius:10px; padding:4px; width:fit-content; }
+div[data-baseweb='select'] > div, div[data-baseweb='input'] > div { border-radius:8px; }
+textarea { font-family:'DM Sans','Helvetica Neue',Arial,sans-serif !important; line-height:1.55 !important; }
 </style>""", unsafe_allow_html=True)
 module = st.radio("Modul", ["Penjadwalan Jaga, Review, ERM", "Pembagian Jaga"], horizontal=True, label_visibility="collapsed", key="module")
 if module == "Pembagian Jaga":
