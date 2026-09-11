@@ -1,7 +1,9 @@
 import io
 import random
-from collections import Counter
-from datetime import date, timedelta
+import re
+from collections import Counter, defaultdict
+from datetime import date, datetime, timedelta
+from difflib import get_close_matches
 
 import pandas as pd
 import streamlit as st
@@ -18,6 +20,195 @@ ROSTER = {"Aliyah":"F", "Soma":"M", "Syamsul":"M", "Ferrel":"M", "Kezia":"F", "A
 NAMES = list(ROSTER)
 DAY_NAMES = ("Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu")
 MONTHS = ("Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli", "Agustus", "September", "Oktober", "November", "Desember")
+WEEKDAY_WORDS = {"senin", "selasa", "rabu", "kamis", "jumat", "sabtu", "minggu"}
+DOCTOR_WORDS = {"drg", "dr", "sp", "mmf", "mf", "subsp", "comf", "tr", "tm", "mars", "ph", "d", *WEEKDAY_WORDS}
+
+
+def default_cohort_config():
+    """Default only. Admin can add, remove, rename, or change each row before parsing."""
+    return pd.DataFrame([
+        {"Kolom": "a12", "Label angkatan": "Angkatan 12", "Residen per hari": 1, "Aktif": True},
+        {"Kolom": "a13", "Label angkatan": "Angkatan 13", "Residen per hari": 2, "Aktif": True},
+        {"Kolom": "a14", "Label angkatan": "Angkatan 14", "Residen per hari": 3, "Aktif": True},
+        {"Kolom": "a15", "Label angkatan": "Angkatan 15", "Residen per hari": 4, "Aktif": True},
+        {"Kolom": "a16", "Label angkatan": "Angkatan 16", "Residen per hari": 5, "Aktif": True},
+        {"Kolom": "a17", "Label angkatan": "Angkatan 17", "Residen per hari": 5, "Aktif": True},
+    ])
+
+
+def roster_words(value):
+    return re.findall(r"[A-Za-zÀ-ÿ]+(?:[-'][A-Za-zÀ-ÿ]+)?", str(value))
+
+
+def clean_sentence(value):
+    return re.sub(r"\s+", " ", str(value)).strip(" ,;")
+
+
+def split_roster_blocks(text):
+    """Split a Word/Google Docs table copy by its repeated weekday header."""
+    header = re.compile(r"(?m)^(?=(?:(?:Senin|Selasa|Rabu|Kamis|Jumat|Sabtu|Minggu)(?:\s+|$))+$)")
+    points = [match.start() for match in header.finditer(text)]
+    if not points:
+        return [text]
+    return [text[start:end] for start, end in zip(points, points[1:] + [len(text)])]
+
+
+def parse_pasted_roster(text, config):
+    """Parse a visual table pasted as text without requiring a CSV upload.
+
+    Word often wraps cells at different points. The parser first reads the weekly
+    date block and then reconstructs each cohort from its expected member count.
+    It also learns cohort membership from clean blocks, allowing it to recover
+    rows whose columns were interleaved during copying.
+    """
+    active = config.copy()
+    active["Kolom"] = active["Kolom"].astype(str).str.strip().str.lower()
+    active["Residen per hari"] = pd.to_numeric(active["Residen per hari"], errors="coerce").fillna(0).astype(int)
+    active = active[(active["Aktif"] == True) & active["Kolom"].ne("") & (active["Residen per hari"] > 0)]
+    definitions = [(row["Kolom"], int(row["Residen per hari"])) for _, row in active.iterrows()]
+    if not definitions:
+        return pd.DataFrame(), ["Tambahkan minimal satu angkatan aktif dengan jumlah residen per hari lebih dari nol."], []
+
+    blocks, warnings, skipped = [], [], []
+    for block_number, block in enumerate(split_roster_blocks(text), start=1):
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        dates = re.findall(r"\b\d{2}/\d{2}/\d{4}\b", block)
+        if not dates:
+            continue
+        column_count = len(dates)
+        date_line = max(index for index, line in enumerate(lines) if re.search(r"\d{2}/\d{2}/\d{4}", line))
+        operational_start = None
+        for index, line in enumerate(lines[date_line + 1:], start=date_line + 1):
+            words = roster_words(line)
+            if len(words) == column_count and all(word.lower() not in DOCTOR_WORDS for word in words):
+                operational_start = index
+                break
+        if operational_start is None:
+            skipped.extend(dates)
+            warnings.append(f"Blok {block_number}: ditemukan {column_count} tanggal, tetapi baris Pilot tidak memiliki {column_count} nama. Blok tidak dipetakan agar tidak salah.")
+            continue
+
+        stream = roster_words(" ".join(lines[operational_start:]))
+        required = column_count * (2 + sum(size for _, size in definitions))
+        if len(stream) < required:
+            skipped.extend(dates)
+            warnings.append(f"Blok {block_number}: roster hanya memiliki {len(stream)} nama, sedangkan konfigurasi membutuhkan {required}. Blok tidak dipetakan.")
+            continue
+
+        doctors_text = " ".join(lines[date_line + 1:operational_start])
+        doctor_parts = [clean_sentence(item) for item in re.split(r"(?i)(?=(?:dr\.\s*)?drg\.)", doctors_text) if re.search(r"(?i)(?:dr\.\s*)?drg\.", item)]
+        provisional, position = {}, 2 * column_count
+        for code, size in definitions:
+            provisional[code] = stream[position:position + column_count * size]
+            position += column_count * size
+        blocks.append({
+            "dates": dates,
+            "count": column_count,
+            "pilot": stream[:column_count],
+            "copilot": stream[column_count:2 * column_count],
+            "tail": stream[2 * column_count:],
+            "provisional": provisional,
+            "doctors": doctor_parts,
+        })
+
+    # Establish cohort identity from the first positional pass. This corrects the
+    # common Word-copy issue where the A14/A15 visual cells appear interleaved.
+    votes = defaultdict(Counter)
+    display_names = {}
+    for block in blocks:
+        for code, people in block["provisional"].items():
+            for person in people:
+                key = person.lower()
+                votes[key][code] += 1
+                display_names.setdefault(key, person)
+    owner = {person: counts.most_common(1)[0][0] for person, counts in votes.items()}
+    known_names = list(display_names)
+
+    rows = []
+    for block in blocks:
+        count = block["count"]
+        corrected_tail = []
+        for person in block["tail"]:
+            key = person.lower()
+            if key not in owner:
+                close = get_close_matches(key, known_names, n=1, cutoff=.83)
+                if close:
+                    warnings.append(f"Nama `{person}` dibaca sebagai `{display_names[close[0]]}` karena ejaan sangat mirip.")
+                    person, key = display_names[close[0]], close[0]
+            corrected_tail.append(person)
+        groups = {}
+        for code, size in definitions:
+            recovered = [person for person in corrected_tail if owner.get(person.lower()) == code]
+            expected = count * size
+            groups[code] = recovered if len(recovered) == expected else block["provisional"][code]
+            if len(recovered) not in (0, expected):
+                warnings.append(f"{block['dates'][0]}: {code} terbaca {len(recovered)}/{expected} nama setelah pemulihan; gunakan hasil preview untuk koreksi.")
+        for index, raw_date in enumerate(block["dates"]):
+            item = {
+                "Tanggal": datetime.strptime(raw_date, "%d/%m/%Y").date().isoformat(),
+                "DPJP": block["doctors"][index] if len(block["doctors"]) == count else "",
+                "Pilot": block["pilot"][index],
+                "Co-pilot": block["copilot"][index],
+            }
+            for code, size in definitions:
+                people = groups[code][index * size:(index + 1) * size]
+                item[code] = ", ".join(people)
+            rows.append(item)
+        if len(block["doctors"]) != count:
+            warnings.append(f"{block['dates'][0]}: DPJP tidak dapat dipisahkan otomatis. Isi kolom DPJP pada tabel preview bila diperlukan.")
+
+    if skipped:
+        pretty = ", ".join(datetime.strptime(value, "%d/%m/%Y").strftime("%d %b") for value in skipped)
+        warnings.append(f"Tanggal yang belum masuk preview: {pretty}.")
+    return pd.DataFrame(rows), list(dict.fromkeys(warnings)), skipped
+
+
+def render_roster_intake():
+    st.markdown("<div class='masthead'><div class='service-line'>DEPARTEMEN BEDAH MULUT & MAKSILOFASIAL</div><h1>Pembagian Jaga</h1><p>Tempel tabel roster apa adanya. Sistem memetakan tanggal dan angkatan terlebih dahulu, lalu admin dapat mengoreksi hasil sebelum pembagian dibuat.</p></div>", unsafe_allow_html=True)
+    st.markdown("<div class='panel'><b>1. Konfigurasi angkatan</b><br><span style='color:#60717d'>Kolom dan jumlah residen per hari tidak dikunci. Tambah, hapus, atau ubah label sebelum membaca roster.</span></div>", unsafe_allow_html=True)
+    if "cohort_config" not in st.session_state:
+        st.session_state.cohort_config = default_cohort_config()
+    config = st.data_editor(
+        st.session_state.cohort_config,
+        num_rows="dynamic",
+        hide_index=True,
+        use_container_width=True,
+        column_config={"Residen per hari": st.column_config.NumberColumn(min_value=1, step=1), "Aktif": st.column_config.CheckboxColumn()},
+        key="cohort_config_editor",
+    )
+    st.session_state.cohort_config = config
+
+    st.markdown("<div class='panel'><b>2. Tempel roster</b><br><span style='color:#60717d'>Tidak perlu unggah CSV. Paste langsung dari Word, Google Docs, atau tabel sumber.</span></div>", unsafe_allow_html=True)
+    pasted = st.text_area("Roster yang ditempel", value=st.session_state.get("pasted_roster", ""), height=250, placeholder="Tempel seluruh tabel roster di sini…", key="pasted_roster_input")
+    if st.button("Petakan roster", type="primary", use_container_width=False):
+        st.session_state.pasted_roster = pasted
+        parsed, warnings, skipped = parse_pasted_roster(pasted, config)
+        st.session_state.parsed_roster = parsed
+        st.session_state.roster_warnings = warnings
+        st.session_state.roster_skipped = skipped
+
+    parsed = st.session_state.get("parsed_roster")
+    if parsed is None:
+        st.info("Mulai dengan menempel roster, lalu cek hasil pemetaan. Pembagian klinis belum dibuat sebelum roster dinyatakan benar.")
+        return
+    warnings = st.session_state.get("roster_warnings", [])
+    for warning in warnings:
+        st.warning(warning)
+    if parsed.empty:
+        st.error("Belum ada tanggal yang dapat dipetakan. Cek kembali struktur paste dan jumlah residen per angkatan.")
+        return
+
+    labels = dict(zip(config["Kolom"].astype(str).str.lower(), config["Label angkatan"].astype(str)))
+    shown = parsed.rename(columns=labels)
+    st.markdown("<div class='panel'><b>3. Verifikasi dan koreksi</b><br><span style='color:#60717d'>Inilah sumber untuk pembagian berikutnya. Koreksi langsung di tabel bila nama atau DPJP terpotong saat copy-paste.</span></div>", unsafe_allow_html=True)
+    edited = st.data_editor(shown, num_rows="dynamic", hide_index=True, use_container_width=True, height=520, key="parsed_roster_editor")
+    reverse_labels = {label: code for code, label in labels.items()}
+    st.session_state.parsed_roster = edited.rename(columns=reverse_labels)
+    metrics = st.columns(3)
+    metrics[0].metric("Tanggal terbaca", len(edited))
+    metrics[1].metric("Angkatan aktif", len(labels))
+    metrics[2].metric("Butuh koreksi", len(st.session_state.get("roster_skipped", [])))
+    st.caption("Setelah tabel ini rapi, tahap berikutnya adalah mengaktifkan pembagian Post-op, Pre-op, dan IGD dari roster yang telah diverifikasi. Tidak ada data yang dikirim ke database atau membutuhkan unggahan CSV.")
 
 
 def init_state():
@@ -235,9 +426,13 @@ div[data-testid='stTabs'] button { font-family:'Manrope',sans-serif; font-size:.
 div[data-testid='stExpander'] { background:#fff; border:1px solid var(--line); border-radius:10px; }
 div[data-testid='stDataFrame'] { border:1px solid var(--line); border-radius:10px; overflow:hidden; }
 </style>""", unsafe_allow_html=True)
+module = st.radio("Modul", ["Penjadwalan Jaga, Review, ERM", "Pembagian Jaga"], horizontal=True, label_visibility="collapsed", key="module")
+if module == "Pembagian Jaga":
+    render_roster_intake()
+    st.stop()
 st.markdown("<div class='masthead'><div class='service-line'>DEPARTEMEN BEDAH MULUT & MAKSILOFASIAL • ANGKATAN 15</div><h1>Clinical Duty Roster</h1><p>Susun Jaga, Review, dan ERM dengan distribusi yang tervalidasi. Fairness total dan hari Minggu dikunci sebelum jadwal dapat diekspor.</p></div>", unsafe_allow_html=True)
 
-today=date.today(); mode=st.radio("Jenis jadwal",["Bulanan","Rentang tanggal"],horizontal=True,label_visibility="collapsed")
+today=date.today(); mode=st.radio("Jenis jadwal",["Bulanan","Rentang tanggal"],horizontal=True,label_visibility="collapsed",key="schedule_mode")
 if mode=="Bulanan":
     left,right=st.columns([2,1])
     with left: month=st.selectbox("Bulan",list(range(1,13)),index=today.month-1,format_func=lambda item:MONTHS[item-1])
@@ -256,7 +451,7 @@ with c3:q_erm=int(st.number_input("ERM",0,len(NAMES),2))
 with c4:seed=int(st.number_input("Variasi jadwal",1,999999,1501,help="Ganti angka untuk alternatif yang tetap fair."))
 
 with st.expander("Aturan tim & request khusus"):
-    doru=st.multiselect("Doru — tepat 2 orang (tetap Jaga, tidak masuk Review/ERM)",NAMES,default=["Ferrel","Alam"],max_selections=2)
+    doru=st.multiselect("Doru — tepat 2 orang (tetap Jaga, tidak masuk Review/ERM)",NAMES,default=["Ferrel","Alam"],max_selections=2,key="doru")
     left,right=st.columns(2)
     with left:
         st.markdown("#### Tidak tersedia untuk Jaga")
@@ -282,8 +477,8 @@ if start>end: st.error("Tanggal selesai harus sesudah tanggal mulai.")
 elif len(doru)!=2: st.error("Pilih tepat dua Doru.")
 elif total_roles>len(NAMES): st.error("Total kuota harian melebihi 11 anggota; satu orang tidak boleh memegang dua peran sehari.")
 g1,g2,g3=st.columns([1.3,1,3])
-with g1: generate=st.button("Buat jadwal fair",type="primary",use_container_width=True,disabled=not valid)
-with g2: shuffle=st.button("Acak ulang",use_container_width=True,disabled=not valid)
+with g1: generate=st.button("Buat jadwal fair",type="primary",use_container_width=True,disabled=not valid,key="generate")
+with g2: shuffle=st.button("Acak ulang",use_container_width=True,disabled=not valid,key="shuffle")
 with g3: st.caption("Aturan keras: satu peran/hari • Doru hanya Jaga • total Jaga dan Jaga Minggu selisih maksimal satu.")
 if generate or shuffle:
     days=[start+timedelta(days=index) for index in range((end-start).days+1)]; quotas={"Jaga":q_jaga,"Review":q_review,"ERM":q_erm}
