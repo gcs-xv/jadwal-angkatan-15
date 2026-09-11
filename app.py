@@ -594,8 +594,6 @@ def render_assignment_workspace(parsed, config, month_key, is_admin):
         current_post, current_pre, current_igd = [], [], []
         remove_post = remove_pre = remove_igd = None
         with post_col:
-            st.caption("Post-op — tambah pasien dengan tombol +")
-            post_table = st.data_editor(pd.DataFrame([{"Pasien": "", "POD awal": "POD 0"}]), num_rows="dynamic", hide_index=True, use_container_width=True, height=180, key=f"post_table_{selected_date}")
             st.markdown("#### Post-op")
             st.caption("Nama pasien, kasus, dan POD awal")
             for index, entry in enumerate(post_entries):
@@ -611,8 +609,6 @@ def render_assignment_workspace(parsed, config, month_key, is_admin):
                 current_post.append({"id": row_id, "name": name, "case": case, "pod": pod})
             add_post = st.form_submit_button("+ Tambah pasien Post-op", key=f"add_post_{selected_date}", use_container_width=True)
         with pre_col:
-            st.caption("Pre-op — tambah pasien dengan tombol +")
-            pre_table = st.data_editor(pd.DataFrame([{"Pasien": ""}]), num_rows="dynamic", hide_index=True, use_container_width=True, height=180, key=f"pre_table_{selected_date}")
             st.markdown("#### Pre-op")
             st.caption("Nama pasien dan kasus")
             for index, entry in enumerate(pre_entries):
@@ -626,8 +622,6 @@ def render_assignment_workspace(parsed, config, month_key, is_admin):
                 current_pre.append({"id": row_id, "name": name, "case": case})
             add_pre = st.form_submit_button("+ Tambah pasien Pre-op", key=f"add_pre_{selected_date}", use_container_width=True)
         with igd_col:
-            st.caption("IGD — tambah pasien dengan tombol +")
-            igd_table = st.data_editor(pd.DataFrame([{"Pasien": ""}]), num_rows="dynamic", hide_index=True, use_container_width=True, height=180, key=f"igd_table_{selected_date}")
             st.markdown("#### IGD")
             st.caption("Nama pasien dan kasus")
             for index, entry in enumerate(igd_entries):
@@ -662,7 +656,6 @@ def render_assignment_workspace(parsed, config, month_key, is_admin):
     if generate:
         st.session_state[post_state], st.session_state[pre_state], st.session_state[igd_state] = current_post, current_pre, current_igd
         assignment = build_daily_assignment(
-            roster, selected_date, patients_from_table(post_table, post_op=True), patients_from_table(pre_table), patients_from_table(igd_table), pilot, copilot, erm, review,
             roster, selected_date, patients_from_entries(current_post, post_op=True), patients_from_entries(current_pre), patients_from_entries(current_igd), pilot, copilot, erm, review,
         )
         st.session_state.assignment_draft = assignment
@@ -672,11 +665,9 @@ def render_assignment_workspace(parsed, config, month_key, is_admin):
     assignment_to_edit = draft or (saved or {}).get("assignment")
     if assignment_to_edit:
         initial_text = assignment_text(assignment_to_edit, labels)
-        st.markdown("<div class='panel'><b>Pratinjau pembagian</b><br><span style='color:#60717d'>Ubah teks bila ada pembagian manual, lalu simpan. Teks tersimpan menjadi pembagian resmi untuk tanggal ini.</span></div>", unsafe_allow_html=True)
         st.markdown("<div class='panel'><b>Ubah pembagian</b><br><span style='color:#60717d'>Semua teks di bawah dapat diubah. Tombol simpan akan menimpa pembagian tanggal ini di Supabase.</span></div>", unsafe_allow_html=True)
         with st.form(f"assignment_save_form_{selected_date}", border=False):
             manual_text = st.text_area("Pembagian tanggal terpilih", value=(saved or {}).get("assignment_text", initial_text) if not draft else initial_text, height=440, key=f"assignment_text_{selected_date}")
-            save_assignment = st.form_submit_button("Simpan pembagian tanggal ini", type="primary", use_container_width=True)
             save_assignment = st.form_submit_button("Paksa simpan perubahan manual", type="primary", use_container_width=True)
         if save_assignment:
             error = save_daily_assignment(month_key, selected_date, assignment_to_edit, manual_text)
@@ -704,7 +695,6 @@ def render_roster_intake():
         elif stored:
             st.success(f"Roster {MONTHS[month_number - 1]} {year} dimuat. Terakhir diperbarui {stored.get('updated_at', '-') }.")
 
-    is_admin = admin_access()
     config = st.session_state.cohort_config
     parsed = st.session_state.get("parsed_roster")
     is_admin = bool(st.session_state.get("roster_admin", False))
@@ -779,8 +769,6 @@ def render_roster_intake():
     metrics[1].metric("Angkatan aktif", len(labels))
     metrics[2].metric("Butuh koreksi", len(st.session_state.get("roster_skipped", [])))
     st.caption("Roster ini adalah sumber pembagian Post-op, Pre-op, dan IGD. Pilot dan Co-pilot akan dipilih dari kelompok yang tersedia saat pembagian, bukan dibaca dari paste. Pengguna biasa tidak dapat mengubah roster.")
-    st.divider()
-    render_assignment_workspace(st.session_state.parsed_roster, config, month_key, is_admin)
 
 
 def init_state():
