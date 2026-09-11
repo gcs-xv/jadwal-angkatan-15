@@ -528,14 +528,8 @@ def render_assignment_workspace(parsed, config, month_key, is_admin):
     if saved:
         st.markdown("<div class='panel'><b>Pembagian tersimpan</b><br><span style='color:#60717d'>Versi ini dapat diakses kembali setiap kali tanggal tersebut dibuka.</span></div>", unsafe_allow_html=True)
         st.code(saved.get("assignment_text", ""), language=None)
-        if not is_admin:
-            return
     elif not is_admin:
-        st.info("Belum ada pembagian tersimpan untuk tanggal ini.")
-        return
-
-    if not is_admin:
-        return
+        st.info("Belum ada pembagian tersimpan untuk tanggal ini. Isi pasien di bawah untuk membuat pembagian pertama.")
     st.markdown("<div class='panel'><b>Buat atau bagi ulang</b><br><span style='color:#60717d'>Algoritme membagi setiap angkatan secara proporsional pada Post-op, Pre-op, dan IGD.</span></div>", unsafe_allow_html=True)
     default_person = all_names[0] if all_names else ""
     one, two, three, four = st.columns(4)
