@@ -53,34 +53,91 @@ def choose_role(candidates, need, counts, rng):
     return sorted(candidates, key=lambda person: (counts[person], rng.random()))[:need]
 
 
+def make_fair_jaga(days, quota, female_requested, unavailable, rng):
+    """Return a fair Jaga allocation for any daily quota that is feasible."""
+    total_slots = len(days) * quota
+    base, extras = divmod(total_slots, len(NAMES))
+    ordered = NAMES[:]
+    rng.shuffle(ordered)
+    targets = {name: base + (index < extras) for index, name in enumerate(ordered)}
+    women = [name for name in NAMES if ROSTER[name] == "F"]
+    notices = []
+
+    female_possible = sum(targets[name] for name in women) >= len(days)
+    female_possible = female_possible and all(
+        any(ROSTER[name] == "F" and day.isoformat() not in unavailable[name] for name in NAMES)
+        for day in days
+    )
+    require_female = female_requested and female_possible
+    if female_requested and not require_female:
+        notices.append("Syarat minimal satu perempuan per hari dilonggarkan otomatis karena bertentangan dengan fairness Jaga pada kuota ini.")
+
+    max_without_three = (len(days) // 3) * 2 + min(len(days) % 3, 2)
+    enforce_streak = total_slots <= len(NAMES) * max_without_three
+    if not enforce_streak:
+        notices.append("Batas maksimal dua Jaga berturut-turut dilonggarkan otomatis karena kuota harian terlalu tinggi; fairness Jaga tetap dijaga.")
+
+    for _ in range(600):
+        remaining = Counter(targets)
+        allocation = []
+        failed = False
+        for index, day in enumerate(days):
+            key = day.isoformat()
+            previous = allocation[-1] if allocation else set()
+            previous_two = allocation[-2] if len(allocation) > 1 else set()
+
+            def eligible(person):
+                return remaining[person] > 0 and key not in unavailable[person] and (
+                    not enforce_streak or not (person in previous and person in previous_two)
+                )
+
+            picked = []
+            if require_female:
+                candidates = [name for name in women if eligible(name)]
+                if not candidates:
+                    failed = True
+                    break
+                picked.append(max(candidates, key=lambda name: (remaining[name], name not in previous, rng.random())))
+
+            while len(picked) < quota:
+                candidates = [name for name in NAMES if name not in picked and eligible(name)]
+                if require_female:
+                    female_budget = sum(remaining[name] for name in women)
+                    female_budget -= sum(ROSTER[name] == "F" for name in picked)
+                    female_budget -= len(days) - index - 1
+                    if female_budget <= 0:
+                        non_women = [name for name in candidates if ROSTER[name] != "F"]
+                        if non_women:
+                            candidates = non_women
+                if not candidates:
+                    failed = True
+                    break
+                picked.append(max(candidates, key=lambda name: (remaining[name], name not in previous, name not in previous_two, rng.random())))
+            if failed:
+                break
+            for name in picked:
+                remaining[name] -= 1
+            allocation.append(set(picked))
+
+        if not failed and not any(remaining.values()):
+            return allocation, notices
+
+    return None, ["Kuota Jaga atau data tidak tersedia membuat jadwal fair tidak dapat dibentuk. Ubah ketersediaan atau kurangi kuota."]
+
+
 def make_schedule(days, quotas, doru, female_required, unavailable, seed):
-    """Build a certified schedule. Jaga has equal counts (difference <= 1)."""
     rng = random.Random(seed)
     counts = {role: Counter() for role in quotas}
     sunday = Counter()
-    rows, warnings, jaga_days = [], [], []
-    offset = rng.randrange(len(NAMES))
+    rows, notices = [], []
+    jaga_days, jaga_notices = make_fair_jaga(days, quotas["Jaga"], female_required, unavailable, rng)
+    if jaga_days is None:
+        return None, None, jaga_notices, None
+    notices.extend(jaga_notices)
 
     for index, day in enumerate(days):
         key = day.isoformat()
-        wanted = [NAMES[(offset + index * quotas["Jaga"] + slot) % len(NAMES)] for slot in range(quotas["Jaga"])]
-        jaga = [person for person in wanted if key not in unavailable[person]]
-        while len(jaga) < quotas["Jaga"]:
-            previous = jaga_days[-1] if jaga_days else set()
-            candidates = [person for person in NAMES if person not in jaga and key not in unavailable[person]]
-            candidates.sort(key=lambda person: (person in previous, counts["Jaga"][person], rng.random()))
-            if not candidates:
-                return None, None, [f"{day:%d %b}: kuota Jaga tidak dapat dipenuhi."], None
-            jaga.append(candidates[0])
-        if female_required and not any(ROSTER[person] == "F" for person in jaga):
-            previous = jaga_days[-1] if jaga_days else set()
-            women = [person for person in NAMES if ROSTER[person] == "F" and person not in jaga and key not in unavailable[person]]
-            if not women:
-                return None, None, [f"{day:%d %b}: tidak ada perempuan tersedia untuk Jaga."], None
-            replacement = min(women, key=lambda person: (person in previous, counts["Jaga"][person], rng.random()))
-            removable = max(jaga, key=lambda person: (ROSTER[person] == "F", counts["Jaga"][person], person in previous))
-            jaga[jaga.index(removable)] = replacement
-
+        jaga = sorted(jaga_days[index])
         used = set(jaga)
         review_pool = [person for person in NAMES if person not in used and person not in doru and key not in unavailable[person]]
         review = choose_role(review_pool, quotas["Review"], counts["Review"], rng)
@@ -96,19 +153,16 @@ def make_schedule(days, quotas, doru, female_required, unavailable, seed):
             counts[role].update(people)
         if day.weekday() == 6:
             sunday.update(jaga)
-        jaga_days.append(set(jaga))
         rows.append({"date": day.isoformat(), "Tanggal": day.strftime("%a, %d %b %Y"), "jaga": ", ".join(jaga), "review": ", ".join(review), "erm": ", ".join(erm), "Jaga": ", ".join(jaga), "Review": ", ".join(review), "ERM": ", ".join(erm)})
 
     jaga_values = [counts["Jaga"][name] for name in NAMES]
     longest = {name: longest_streak(jaga_days, name) for name in NAMES}
     if max(jaga_values) - min(jaga_values) > 1:
-        warnings.append("Ketersediaan yang dipilih membuat fairness Jaga (selisih maksimal satu) tidak dapat dijamin.")
-    if max(longest.values()) > 2:
-        warnings.append("Ketersediaan yang dipilih memaksa tiga Jaga berturut-turut atau lebih.")
-    if warnings:
-        return None, None, warnings, None
+        return None, None, ["Fairness Jaga tidak dapat dijamin untuk konfigurasi ini."], None
+    if max(longest.values()) > 2 and not any("berturut-turut" in note for note in notices):
+        return None, None, ["Batas dua Jaga berturut-turut tidak dapat dipenuhi."], None
     summary = pd.DataFrame({"Nama": NAMES, "Jaga": jaga_values, "Jaga Minggu": [sunday[name] for name in NAMES], "Jaga Berturut Terpanjang": [longest[name] for name in NAMES], "Review": [counts["Review"][name] for name in NAMES], "ERM": [counts["ERM"][name] for name in NAMES]})
-    return pd.DataFrame(rows), summary, [], jaga_days
+    return pd.DataFrame(rows), summary, notices, jaga_days
 
 
 def shade(cell, color):
@@ -180,7 +234,8 @@ def schedule_docx(schedule, summary, start, end):
         doc.add_paragraph().paragraph_format.space_after = Pt(2)
     heading = doc.add_heading("Rekap Fairness Jaga", level=2)
     for run in heading.runs: run.font.name = "Times New Roman"; run.font.color.rgb = RGBColor(0, 0, 0)
-    note = doc.add_paragraph("Selisih total Jaga antaranggota maksimal satu. Tidak ada anggota dengan tiga Jaga berturut-turut.")
+    maximum_streak = int(summary["Jaga Berturut Terpanjang"].max())
+    note = doc.add_paragraph(f"Selisih total Jaga antaranggota maksimal satu. Jaga berturut terpanjang pada jadwal ini: {maximum_streak} hari.")
     note.runs[0].font.name = "Times New Roman"; note.runs[0].font.size = Pt(10)
     recap = doc.add_table(rows=1, cols=len(summary.columns))
     for column, field in enumerate(summary.columns):
@@ -204,7 +259,7 @@ with st.sidebar:
     female = st.checkbox("Jaga wajib ada minimal satu perempuan", value=True)
     seed = st.number_input("Variasi jadwal", 1, 999999, 1501)
 
-st.info("Aturan absolut: setiap orang hanya satu peran per hari; Review dan ERM tidak boleh rangkap; dua Doru tidak boleh Review/ERM tetapi tetap ikut Jaga. Fairness hanya dihitung dari Jaga: selisih total maksimal satu, dengan maksimum dua Jaga berturut-turut.")
+st.info("Aturan absolut: setiap orang hanya satu peran per hari; Review dan ERM tidak boleh rangkap; dua Doru tidak boleh Review/ERM tetapi tetap ikut Jaga; fairness Jaga selisih total maksimal satu. Preferensi: maksimal dua Jaga berturut-turut dan minimal satu perempuan per hari. Preferensi hanya dilonggarkan otomatis bila secara hitungan tidak mungkin, lalu alasannya ditampilkan.")
 unavailable_text = st.text_area("Tidak tersedia (opsional)", placeholder="Aliyah: 2026-09-12, 2026-09-15", help="Format satu baris per orang: Nama: YYYY-MM-DD, YYYY-MM-DD")
 if len(doru) != 2:
     st.warning("Pilih tepat dua orang Doru sebelum membuat jadwal.")
@@ -215,7 +270,7 @@ if st.button("Buat jadwal", type="primary", disabled=len(doru) != 2):
     else:
         days = [start + timedelta(days=index) for index in range(int(total_days))]
         schedule, summary, warnings, _ = make_schedule(days, quotas, set(doru), female, parse_unavailable(unavailable_text), int(seed))
-        if warnings:
+        if schedule is None:
             st.error("\n".join(warnings))
             st.caption("Ubah ketersediaan, kuota, atau tanggal. Jadwal tidak diekspor bila aturan fairness Jaga tidak terpenuhi.")
         else:
@@ -223,14 +278,17 @@ if st.button("Buat jadwal", type="primary", disabled=len(doru) != 2):
             st.session_state["summary"] = summary
             st.session_state["start"] = start
             st.session_state["end"] = days[-1]
+            st.session_state["notices"] = warnings
 
 if "schedule" in st.session_state:
     schedule = st.session_state["schedule"]
     summary = st.session_state["summary"]
     st.subheader("Jadwal")
-    st.table(schedule[["Tanggal", "Jaga", "Review", "ERM"]], )
+    st.table(schedule[["Tanggal", "Jaga", "Review", "ERM"]])
     st.subheader("Ringkasan fairness Jaga")
-    st.table(summary.sort_values("Nama"), )
+    st.table(summary.sort_values("Nama"))
+    for notice in st.session_state.get("notices", []):
+        st.warning(notice)
     word_file = schedule_docx(schedule, summary, st.session_state["start"], st.session_state["end"])
     st.download_button("Unduh jadwal Word", word_file, "jadwal-angkatan-15.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-    st.success("Jadwal tervalidasi: semua anggota mendapat porsi Jaga yang setara (selisih maksimal satu) dan tidak ada tiga Jaga berturut-turut.")
+    st.success("Jadwal tervalidasi: semua anggota mendapat porsi Jaga yang setara (selisih maksimal satu).")
