@@ -2,9 +2,11 @@ import io
 import json
 import random
 import re
+import csv
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
 from difflib import get_close_matches
+from urllib.parse import urlparse
 
 import pandas as pd
 import streamlit as st
@@ -61,6 +63,37 @@ def split_roster_blocks(text):
     return [text[start:end] for start, end in zip(points, points[1:] + [len(text)])]
 
 
+def parse_tabular_roster(text, config):
+    """Read a TSV/CSV table copied directly from a spreadsheet or CSV preview."""
+    delimiter = "\t" if "\t" in text else ";"
+    table = list(csv.reader(io.StringIO(text), delimiter=delimiter))
+    active = config.copy()
+    active["Kolom"] = active["Kolom"].astype(str).str.strip().str.lower()
+    active = active[(active["Aktif"] == True) & active["Kolom"].ne("")]
+    definitions = list(active["Kolom"])
+    rows, warnings = [], []
+    for line_number, cells in enumerate(table, start=1):
+        cells = [cell.strip() for cell in cells]
+        if not any(cells) or (cells and cells[0].lower() == "month"):
+            continue
+        if len(cells) < 3 + len(definitions):
+            warnings.append(f"Baris {line_number} tidak dipetakan karena hanya memiliki {len(cells)} kolom; konfigurasi membutuhkan minimal {3 + len(definitions)}.")
+            continue
+        try:
+            parsed_date = datetime.strptime(cells[1], "%Y-%m-%d").date()
+        except ValueError:
+            try:
+                parsed_date = datetime.strptime(cells[1], "%d/%m/%Y").date()
+            except ValueError:
+                warnings.append(f"Baris {line_number} tidak dipetakan karena tanggal `{cells[1]}` tidak dikenali.")
+                continue
+        item = {"Tanggal": parsed_date.isoformat(), "DPJP": cells[2]}
+        for index, code in enumerate(definitions, start=3):
+            item[code] = re.sub(r"\s*\|\s*", ", ", cells[index]).strip()
+        rows.append(item)
+    return pd.DataFrame(rows), list(dict.fromkeys(warnings)), []
+
+
 def parse_pasted_roster(text, config):
     """Parse a visual table pasted as text without requiring a CSV upload.
 
@@ -69,6 +102,10 @@ def parse_pasted_roster(text, config):
     It also learns cohort membership from clean blocks, allowing it to recover
     rows whose columns were interleaved during copying.
     """
+    non_empty_lines = [line for line in text.splitlines() if line.strip()]
+    if len(non_empty_lines) >= 2 and ("\t" in non_empty_lines[0] or non_empty_lines[0].count(";") >= 3):
+        return parse_tabular_roster(text, config)
+
     active = config.copy()
     active["Kolom"] = active["Kolom"].astype(str).str.strip().str.lower()
     active["Residen per hari"] = pd.to_numeric(active["Residen per hari"], errors="coerce").fillna(0).astype(int)
@@ -185,6 +222,9 @@ def database():
         return None, "Library Supabase belum terpasang. Jalankan ulang deployment setelah requirements diperbarui."
     if not url or not secret_key:
         return None, "Supabase belum dikonfigurasi di Streamlit Secrets."
+    parsed_url = urlparse(str(url))
+    if parsed_url.scheme != "https" or not parsed_url.hostname or not parsed_url.hostname.endswith(".supabase.co") or parsed_url.path not in ("", "/"):
+        return None, "SUPABASE_URL harus berupa Project URL API seperti `https://abcdefgh.supabase.co`, bukan URL dashboard Supabase."
     try:
         return get_supabase_client(url, secret_key), None
     except Exception as error:
@@ -221,7 +261,10 @@ def save_monthly_roster(month_key, roster, config):
         }, on_conflict="roster_month").execute()
         return None
     except Exception as error:
-        return f"Roster belum tersimpan: {error}"
+        message = str(error)
+        if "JSON could not be generated" in message or "404" in message:
+            return "Supabase mengembalikan 404. Periksa SUPABASE_URL: gunakan Project URL API `https://<project-ref>.supabase.co`, bukan tautan dashboard."
+        return f"Roster belum tersimpan: {message}"
 
 
 def reset_month_state(month_key):
@@ -281,15 +324,21 @@ def render_roster_intake():
 
     if is_admin:
         st.markdown("<div class='panel'><b>Konfigurasi angkatan</b><br><span style='color:#60717d'>Awalnya data bernama Kelompok 1–8. Ubah labelnya menjadi angkatan yang benar, serta tambahkan atau kurangi baris bila format sumber berubah.</span></div>", unsafe_allow_html=True)
-        config = st.data_editor(
-            config,
-            num_rows="dynamic",
-            hide_index=True,
-            use_container_width=True,
-            column_config={"Residen per hari": st.column_config.NumberColumn(min_value=1, step=1), "Aktif": st.column_config.CheckboxColumn()},
-            key="cohort_config_editor",
-        )
-        st.session_state.cohort_config = config
+        with st.form("cohort_config_form", border=False):
+            edited_config = st.data_editor(
+                config,
+                num_rows="dynamic",
+                hide_index=True,
+                use_container_width=True,
+                column_config={"Residen per hari": st.column_config.NumberColumn(min_value=1, step=1), "Aktif": st.column_config.CheckboxColumn()},
+                key="cohort_config_editor",
+            )
+            apply_config = st.form_submit_button("Terapkan konfigurasi angkatan")
+        if apply_config:
+            st.session_state.cohort_config = edited_config
+            config = edited_config
+            st.session_state.pop("parsed_roster_editor", None)
+            st.success("Konfigurasi angkatan diterapkan. Paste atau petakan ulang roster bila jumlah kelompok berubah.")
         st.markdown("<div class='panel'><b>Tempel atau perbarui roster</b><br><span style='color:#60717d'>Paste hanya sekali untuk bulan ini. Data lama akan diganti saat admin menekan Simpan roster.</span></div>", unsafe_allow_html=True)
         pasted = st.text_area("Roster yang ditempel", value=st.session_state.get("pasted_roster", ""), height=250, placeholder="Tempel seluruh tabel roster di sini…", key="pasted_roster_input")
         if st.button("Petakan roster", type="primary", key="map_roster"):
@@ -299,7 +348,6 @@ def render_roster_intake():
             st.session_state.roster_warnings = warnings
             st.session_state.roster_skipped = skipped
             st.session_state.pop("parsed_roster_editor", None)
-            st.rerun()
         parsed = st.session_state.get("parsed_roster")
 
     if parsed is None:
@@ -315,11 +363,17 @@ def render_roster_intake():
     shown = parsed.rename(columns=labels)
     st.markdown("<div class='panel'><b>Roster bulan terpilih</b><br><span style='color:#60717d'>Pastikan tabel ini benar sebelum dipakai untuk pembagian jaga.</span></div>", unsafe_allow_html=True)
     if is_admin:
-        edited = st.data_editor(shown, num_rows="dynamic", hide_index=True, use_container_width=True, height=520, key="parsed_roster_editor")
+        with st.form("roster_editor_form", border=False):
+            edited = st.data_editor(shown, num_rows="dynamic", hide_index=True, use_container_width=True, height=520, key="parsed_roster_editor")
+            apply_col, save_col = st.columns(2)
+            apply_edits = apply_col.form_submit_button("Terapkan koreksi tabel", use_container_width=True)
+            save_roster = save_col.form_submit_button("Simpan roster bulan ini", type="primary", use_container_width=True)
         reverse_labels = {label: code for code, label in labels.items()}
-        st.session_state.parsed_roster = edited.rename(columns=reverse_labels)
-        if st.button("Simpan roster bulan ini", type="primary", key="save_roster"):
-            error = save_monthly_roster(month_key, st.session_state.parsed_roster, config)
+        corrected = edited.rename(columns=reverse_labels)
+        if apply_edits or save_roster:
+            st.session_state.parsed_roster = corrected
+        if save_roster:
+            error = save_monthly_roster(month_key, corrected, config)
             if error:
                 st.error(error)
             else:
