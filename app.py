@@ -4,6 +4,7 @@ import random
 import re
 import csv
 import calendar
+import uuid
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
 from difflib import get_close_matches
@@ -398,6 +399,22 @@ def patients_from_table(frame, post_op=False):
     return patients
 
 
+def patients_from_entries(entries, post_op=False):
+    patients = []
+    for entry in entries:
+        name = str(entry.get("name", "")).strip()
+        case = str(entry.get("case", "")).strip()
+        if not name:
+            continue
+        display = f"{name} ({case})" if case else name
+        patients.append({"name": display, "meta": str(entry.get("pod", "")).strip() if post_op else ""})
+    return patients
+
+
+def empty_patient_entry(post_op=False):
+    return {"id": uuid.uuid4().hex, "name": "", "case": "", "pod": "POD 0" if post_op else ""}
+
+
 def pod_labels(meta):
     meta = re.sub(r"\s+", " ", (meta or "").strip())
     if meta:
@@ -556,6 +573,13 @@ def render_assignment_workspace(parsed, config, month_key, is_admin):
         st.info("Belum ada pembagian tersimpan untuk tanggal ini. Isi pasien di bawah untuk membuat pembagian pertama.")
     st.markdown("<div class='panel'><b>Buat atau bagi ulang</b><br><span style='color:#60717d'>Algoritme membagi setiap angkatan secara proporsional pada Post-op, Pre-op, dan IGD.</span></div>", unsafe_allow_html=True)
     default_person = all_names[0] if all_names else ""
+    post_state = f"post_patient_entries_{selected_date}"
+    pre_state = f"pre_patient_entries_{selected_date}"
+    igd_state = f"igd_patient_entries_{selected_date}"
+    st.session_state.setdefault(post_state, [empty_patient_entry(post_op=True)])
+    st.session_state.setdefault(pre_state, [empty_patient_entry()])
+    st.session_state.setdefault(igd_state, [empty_patient_entry()])
+    post_entries, pre_entries, igd_entries = st.session_state[post_state], st.session_state[pre_state], st.session_state[igd_state]
     with st.form(f"assignment_setup_form_{selected_date}", border=False):
         one, two, three, four = st.columns(4)
         with one:
@@ -567,19 +591,79 @@ def render_assignment_workspace(parsed, config, month_key, is_admin):
         with four:
             review = st.selectbox("Review", ["", *all_names], key=f"review_{selected_date}")
         post_col, pre_col, igd_col = st.columns(3)
+        current_post, current_pre, current_igd = [], [], []
+        remove_post = remove_pre = remove_igd = None
         with post_col:
             st.caption("Post-op — tambah pasien dengan tombol +")
             post_table = st.data_editor(pd.DataFrame([{"Pasien": "", "POD awal": "POD 0"}]), num_rows="dynamic", hide_index=True, use_container_width=True, height=180, key=f"post_table_{selected_date}")
+            st.markdown("#### Post-op")
+            st.caption("Nama pasien, kasus, dan POD awal")
+            for index, entry in enumerate(post_entries):
+                row_id = entry["id"]
+                st.caption(f"Pasien {index + 1}")
+                name_col, case_col = st.columns([1, 1])
+                name = name_col.text_input("Nama pasien", value=entry["name"], key=f"post_name_{selected_date}_{row_id}", label_visibility="collapsed", placeholder="Nama pasien")
+                case = case_col.text_input("Kasus", value=entry["case"], key=f"post_case_{selected_date}_{row_id}", label_visibility="collapsed", placeholder="Kasus")
+                pod_col, delete_col = st.columns([3, 1])
+                pod = pod_col.selectbox("POD awal", ["POD 0", "POD I", "POD II", "POD III"], index=["POD 0", "POD I", "POD II", "POD III"].index(entry.get("pod", "POD 0")) if entry.get("pod", "POD 0") in ["POD 0", "POD I", "POD II", "POD III"] else 0, key=f"post_pod_{selected_date}_{row_id}", label_visibility="collapsed")
+                if delete_col.form_submit_button("Hapus", key=f"remove_post_{selected_date}_{row_id}", use_container_width=True):
+                    remove_post = index
+                current_post.append({"id": row_id, "name": name, "case": case, "pod": pod})
+            add_post = st.form_submit_button("+ Tambah pasien Post-op", key=f"add_post_{selected_date}", use_container_width=True)
         with pre_col:
             st.caption("Pre-op — tambah pasien dengan tombol +")
             pre_table = st.data_editor(pd.DataFrame([{"Pasien": ""}]), num_rows="dynamic", hide_index=True, use_container_width=True, height=180, key=f"pre_table_{selected_date}")
+            st.markdown("#### Pre-op")
+            st.caption("Nama pasien dan kasus")
+            for index, entry in enumerate(pre_entries):
+                row_id = entry["id"]
+                st.caption(f"Pasien {index + 1}")
+                name_col, case_col, delete_col = st.columns([1, 1, .55])
+                name = name_col.text_input("Nama pasien", value=entry["name"], key=f"pre_name_{selected_date}_{row_id}", label_visibility="collapsed", placeholder="Nama pasien")
+                case = case_col.text_input("Kasus", value=entry["case"], key=f"pre_case_{selected_date}_{row_id}", label_visibility="collapsed", placeholder="Kasus")
+                if delete_col.form_submit_button("Hapus", key=f"remove_pre_{selected_date}_{row_id}", use_container_width=True):
+                    remove_pre = index
+                current_pre.append({"id": row_id, "name": name, "case": case})
+            add_pre = st.form_submit_button("+ Tambah pasien Pre-op", key=f"add_pre_{selected_date}", use_container_width=True)
         with igd_col:
             st.caption("IGD — tambah pasien dengan tombol +")
             igd_table = st.data_editor(pd.DataFrame([{"Pasien": ""}]), num_rows="dynamic", hide_index=True, use_container_width=True, height=180, key=f"igd_table_{selected_date}")
+            st.markdown("#### IGD")
+            st.caption("Nama pasien dan kasus")
+            for index, entry in enumerate(igd_entries):
+                row_id = entry["id"]
+                st.caption(f"Pasien {index + 1}")
+                name_col, case_col, delete_col = st.columns([1, 1, .55])
+                name = name_col.text_input("Nama pasien", value=entry["name"], key=f"igd_name_{selected_date}_{row_id}", label_visibility="collapsed", placeholder="Nama pasien")
+                case = case_col.text_input("Kasus", value=entry["case"], key=f"igd_case_{selected_date}_{row_id}", label_visibility="collapsed", placeholder="Kasus")
+                if delete_col.form_submit_button("Hapus", key=f"remove_igd_{selected_date}_{row_id}", use_container_width=True):
+                    remove_igd = index
+                current_igd.append({"id": row_id, "name": name, "case": case})
+            add_igd = st.form_submit_button("+ Tambah pasien IGD", key=f"add_igd_{selected_date}", use_container_width=True)
         generate = st.form_submit_button("Buat pembagian otomatis", type="primary", use_container_width=True)
+    if remove_post is not None:
+        st.session_state[post_state] = [entry for index, entry in enumerate(current_post) if index != remove_post]
+        st.rerun()
+    if remove_pre is not None:
+        st.session_state[pre_state] = [entry for index, entry in enumerate(current_pre) if index != remove_pre]
+        st.rerun()
+    if remove_igd is not None:
+        st.session_state[igd_state] = [entry for index, entry in enumerate(current_igd) if index != remove_igd]
+        st.rerun()
+    if add_post:
+        st.session_state[post_state] = current_post + [empty_patient_entry(post_op=True)]
+        st.rerun()
+    if add_pre:
+        st.session_state[pre_state] = current_pre + [empty_patient_entry()]
+        st.rerun()
+    if add_igd:
+        st.session_state[igd_state] = current_igd + [empty_patient_entry()]
+        st.rerun()
     if generate:
+        st.session_state[post_state], st.session_state[pre_state], st.session_state[igd_state] = current_post, current_pre, current_igd
         assignment = build_daily_assignment(
             roster, selected_date, patients_from_table(post_table, post_op=True), patients_from_table(pre_table), patients_from_table(igd_table), pilot, copilot, erm, review,
+            roster, selected_date, patients_from_entries(current_post, post_op=True), patients_from_entries(current_pre), patients_from_entries(current_igd), pilot, copilot, erm, review,
         )
         st.session_state.assignment_draft = assignment
         st.session_state.assignment_draft_date = selected_date
@@ -589,9 +673,11 @@ def render_assignment_workspace(parsed, config, month_key, is_admin):
     if assignment_to_edit:
         initial_text = assignment_text(assignment_to_edit, labels)
         st.markdown("<div class='panel'><b>Pratinjau pembagian</b><br><span style='color:#60717d'>Ubah teks bila ada pembagian manual, lalu simpan. Teks tersimpan menjadi pembagian resmi untuk tanggal ini.</span></div>", unsafe_allow_html=True)
+        st.markdown("<div class='panel'><b>Ubah pembagian</b><br><span style='color:#60717d'>Semua teks di bawah dapat diubah. Tombol simpan akan menimpa pembagian tanggal ini di Supabase.</span></div>", unsafe_allow_html=True)
         with st.form(f"assignment_save_form_{selected_date}", border=False):
             manual_text = st.text_area("Pembagian tanggal terpilih", value=(saved or {}).get("assignment_text", initial_text) if not draft else initial_text, height=440, key=f"assignment_text_{selected_date}")
             save_assignment = st.form_submit_button("Simpan pembagian tanggal ini", type="primary", use_container_width=True)
+            save_assignment = st.form_submit_button("Paksa simpan perubahan manual", type="primary", use_container_width=True)
         if save_assignment:
             error = save_daily_assignment(month_key, selected_date, assignment_to_edit, manual_text)
             if error:
@@ -599,6 +685,7 @@ def render_assignment_workspace(parsed, config, month_key, is_admin):
             else:
                 st.session_state.assignment_draft = None
                 st.success(f"Pembagian {readable_date} tersimpan dan dapat dibuka kembali.")
+                st.rerun()
 
 
 def render_roster_intake():
@@ -620,6 +707,14 @@ def render_roster_intake():
     is_admin = admin_access()
     config = st.session_state.cohort_config
     parsed = st.session_state.get("parsed_roster")
+    is_admin = bool(st.session_state.get("roster_admin", False))
+
+    # Pembagian adalah aktivitas utama. Tampilkan sebelum pengelolaan roster.
+    if parsed is not None and not parsed.empty:
+        render_assignment_workspace(parsed, config, month_key, is_admin)
+        st.divider()
+
+    is_admin = admin_access()
 
     if is_admin:
         st.markdown("<div class='panel'><b>Konfigurasi angkatan</b><br><span style='color:#60717d'>Awalnya data bernama Kelompok 1–8. Ubah labelnya menjadi angkatan yang benar, serta tambahkan atau kurangi baris bila format sumber berubah.</span></div>", unsafe_allow_html=True)
