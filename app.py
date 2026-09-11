@@ -389,10 +389,32 @@ def parse_patient_lines(value, post_op=False):
     return patients
 
 
+def patients_from_table(frame, post_op=False):
+    patients = []
+    for _, row in frame.iterrows():
+        name = str(row.get("Pasien", "")).strip()
+        if name:
+            patients.append({"name": name, "meta": str(row.get("POD awal", "")).strip() if post_op else ""})
+    return patients
+
+
 def pod_labels(meta):
-    meta = (meta or "").strip()
+    meta = re.sub(r"\s+", " ", (meta or "").strip())
     if meta:
-        return (meta, f"{meta} + 1")
+        numeric = re.search(r"(?i)POD\s*(\d+)\s*$", meta)
+        roman = re.search(r"(?i)POD\s*(I|II|III|IV|V|VI|VII|VIII|IX|X)\s*$", meta)
+        if numeric:
+            current = int(numeric.group(1))
+            roman_values = ("I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X")
+            following = roman_values[current] if current < len(roman_values) else str(current + 1)
+            return (f"POD {current}", f"POD {following}")
+        if roman:
+            roman_values = ("I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X")
+            current = roman.group(1).upper()
+            index = roman_values.index(current)
+            following = roman_values[index + 1] if index + 1 < len(roman_values) else str(index + 2)
+            return (f"POD {current}", f"POD {following}")
+        return (meta, "POD I")
     return ("POD I", "POD II")
 
 
@@ -408,29 +430,31 @@ def sort_names_by_cohort(names, roster, cohort_codes):
 
 def build_daily_assignment(roster, assignment_date, post_ops, pre_ops, igds, pilot, copilot, erm, review):
     """Generic version of the legacy cohort-by-cohort assignment theorem."""
+    # Pilot coordinates the day and is not assigned again to Post-op/Pre-op/IGD.
+    roster = {code: [name for name in members if name != pilot] for code, members in roster.items()}
     codes = list(roster)
     post_assignment = []
-    if len(post_ops) == 1:
-        first, second = [], []
+    if post_ops:
+        # Each cohort is allocated independently to every patient-POD slot.
+        # This prevents a small cohort from disappearing from some patients and
+        # preserves fairness inside the cohort rather than across cohorts.
+        teams = [[[], []] for _ in post_ops]
         for code in codes:
-            members = stable_shuffle(roster[code], assignment_date, f"post:{code}")
-            pivot = (len(members) + 1) // 2
-            first.extend(members[:pivot])
-            second.extend(members[pivot:])
-        labels = pod_labels(post_ops[0].get("meta"))
-        post_assignment.append({"name": post_ops[0]["name"], "pod_lines": [
-            {"label": labels[0], "team": sort_names_by_cohort(first, roster, codes)},
-            {"label": labels[1], "team": sort_names_by_cohort(second, roster, codes)},
-        ]})
-    elif post_ops:
-        teams = [[] for _ in post_ops]
-        for code in codes:
-            for index, team in enumerate(distribute_patients(roster[code], len(post_ops), assignment_date, f"post:{code}")):
-                teams[index].extend(team)
+            slots = [(patient_index, pod_index) for patient_index in range(len(post_ops)) for pod_index in range(2)]
+            members = stable_shuffle(roster[code], assignment_date, f"post:{code}:people")
+            if not members:
+                continue
+            target_slots = max(len(slots), len(members))
+            expanded_slots = (slots * (target_slots // len(slots))) + slots[:target_slots % len(slots)]
+            expanded_slots = stable_shuffle(expanded_slots, assignment_date, f"post:{code}:slots")
+            for index, slot in enumerate(expanded_slots):
+                patient_index, pod_index = slot
+                teams[patient_index][pod_index].append(members[index % len(members)])
         for index, patient in enumerate(post_ops):
             labels = pod_labels(patient.get("meta"))
-            team = sort_names_by_cohort(teams[index], roster, codes)
-            post_assignment.append({"name": patient["name"], "pod_lines": [{"label": labels[0], "team": team}, {"label": labels[1], "team": team}]})
+            first_team = sort_names_by_cohort(teams[index][0], roster, codes)
+            second_team = sort_names_by_cohort(teams[index][1], roster, codes)
+            post_assignment.append({"name": patient["name"], "pod_lines": [{"label": labels[0], "team": first_team}, {"label": labels[1], "team": second_team}]})
 
     def build_role_section(patients, final_role, salt):
         roles = ["soap", "rm", "erm", final_role]
@@ -463,9 +487,9 @@ def build_daily_assignment(roster, assignment_date, post_ops, pre_ops, igds, pil
 
 def assignment_text(assignment, labels):
     current = datetime.strptime(assignment["date"], "%Y-%m-%d")
-    lines = [f"PEMBAGIAN TUGAS JAGA — {assignment['day_name'].upper()}, {current:%d/%m/%Y}", "", f"Pilot : {assignment['pilot']}", f"Co-Pilot : {assignment['copilot']}", ""]
+    lines = [f"Pembagian tugas jaga {assignment['day_name']}, {current:%d/%m/%Y}", "", f"Pilot : {assignment['pilot']}", f"Co Pilot : {assignment['copilot']}", ""]
     if assignment["post_op"]:
-        lines.append("POST-OP")
+        lines.append(f"*{len(assignment['post_op'])} Post Op*")
         for index, patient in enumerate(assignment["post_op"], start=1):
             lines.append(f"{index}. {patient['name']}")
             for pod in patient["pod_lines"]:
@@ -532,26 +556,30 @@ def render_assignment_workspace(parsed, config, month_key, is_admin):
         st.info("Belum ada pembagian tersimpan untuk tanggal ini. Isi pasien di bawah untuk membuat pembagian pertama.")
     st.markdown("<div class='panel'><b>Buat atau bagi ulang</b><br><span style='color:#60717d'>Algoritme membagi setiap angkatan secara proporsional pada Post-op, Pre-op, dan IGD.</span></div>", unsafe_allow_html=True)
     default_person = all_names[0] if all_names else ""
-    one, two, three, four = st.columns(4)
-    with one:
-        pilot = st.selectbox("Pilot", ["", *all_names], index=1 if default_person else 0, key=f"pilot_{selected_date}")
-    with two:
-        copilot_options = ["", *[name for name in all_names if name != pilot]]
-        copilot = st.selectbox("Co-pilot", copilot_options, index=1 if len(copilot_options) > 1 else 0, key=f"copilot_{selected_date}")
-    with three:
-        erm = st.selectbox("ERM", ["", *all_names], key=f"erm_{selected_date}")
-    with four:
-        review = st.selectbox("Review", ["", *all_names], key=f"review_{selected_date}")
-    post_col, pre_col, igd_col = st.columns(3)
-    with post_col:
-        post_text = st.text_area("Post-op", placeholder="Nama pasien | POD I\nSatu pasien per baris", height=150, key=f"post_{selected_date}")
-    with pre_col:
-        pre_text = st.text_area("Pre-op", placeholder="Nama pasien\nSatu pasien per baris", height=150, key=f"pre_{selected_date}")
-    with igd_col:
-        igd_text = st.text_area("IGD", placeholder="Nama pasien\nSatu pasien per baris", height=150, key=f"igd_{selected_date}")
-    if st.button("Buat pembagian otomatis", type="primary", key=f"generate_assignment_{selected_date}"):
+    with st.form(f"assignment_setup_form_{selected_date}", border=False):
+        one, two, three, four = st.columns(4)
+        with one:
+            pilot = st.selectbox("Pilot", ["", *all_names], index=1 if default_person else 0, key=f"pilot_{selected_date}")
+        with two:
+            copilot = st.selectbox("Co-pilot", ["", *all_names], index=2 if len(all_names) > 1 else 0, key=f"copilot_{selected_date}")
+        with three:
+            erm = st.selectbox("ERM", ["", *all_names], key=f"erm_{selected_date}")
+        with four:
+            review = st.selectbox("Review", ["", *all_names], key=f"review_{selected_date}")
+        post_col, pre_col, igd_col = st.columns(3)
+        with post_col:
+            st.caption("Post-op — tambah pasien dengan tombol +")
+            post_table = st.data_editor(pd.DataFrame([{"Pasien": "", "POD awal": "POD 0"}]), num_rows="dynamic", hide_index=True, use_container_width=True, height=180, key=f"post_table_{selected_date}")
+        with pre_col:
+            st.caption("Pre-op — tambah pasien dengan tombol +")
+            pre_table = st.data_editor(pd.DataFrame([{"Pasien": ""}]), num_rows="dynamic", hide_index=True, use_container_width=True, height=180, key=f"pre_table_{selected_date}")
+        with igd_col:
+            st.caption("IGD — tambah pasien dengan tombol +")
+            igd_table = st.data_editor(pd.DataFrame([{"Pasien": ""}]), num_rows="dynamic", hide_index=True, use_container_width=True, height=180, key=f"igd_table_{selected_date}")
+        generate = st.form_submit_button("Buat pembagian otomatis", type="primary", use_container_width=True)
+    if generate:
         assignment = build_daily_assignment(
-            roster, selected_date, parse_patient_lines(post_text, post_op=True), parse_patient_lines(pre_text), parse_patient_lines(igd_text), pilot, copilot, erm, review,
+            roster, selected_date, patients_from_table(post_table, post_op=True), patients_from_table(pre_table), patients_from_table(igd_table), pilot, copilot, erm, review,
         )
         st.session_state.assignment_draft = assignment
         st.session_state.assignment_draft_date = selected_date
@@ -860,9 +888,10 @@ st.markdown("""<style>
 .stApp { background:var(--paper); color:var(--ink); font-family:'DM Sans','Helvetica Neue',Arial,sans-serif; }
 .block-container { max-width:1240px; padding-top:2.2rem; padding-bottom:4.5rem; }
 h1,h2,h3,[data-testid='stMetricLabel'] { font-family:'Manrope','Helvetica Neue',Arial,sans-serif; color:var(--ink); letter-spacing:-.035em; }
-.masthead { position:relative; border-bottom:1px solid var(--line); padding:0 0 1.85rem; margin-bottom:1.55rem; }
-.masthead:after { content:''; position:absolute; left:0; bottom:-1px; width:112px; height:3px; background:var(--teal); }
-.masthead h1 { margin:.25rem 0 .3rem; font-size:2.2rem; font-weight:800; }
+.masthead { position:relative; background:#fff; border:1px solid var(--line); border-radius:16px; padding:1.55rem 1.65rem 1.6rem; margin:0 0 1.55rem; overflow:hidden; }
+.masthead:before { content:'OMFS'; position:absolute; right:1.65rem; top:1.35rem; color:#dcebea; font-family:'Manrope',sans-serif; font-size:2.2rem; font-weight:800; letter-spacing:-.08em; }
+.masthead:after { content:''; position:absolute; left:1.65rem; bottom:0; width:112px; height:3px; background:var(--teal); }
+.masthead h1 { position:relative; margin:.25rem 0 .3rem; font-size:2.2rem; font-weight:800; }
 .masthead p { color:var(--muted); max-width:700px; margin:0; font-size:.96rem; }
 .service-line { color:var(--teal); font-family:'Manrope',sans-serif; font-size:.72rem; letter-spacing:.14em; font-weight:800; }
 .panel { background:#fff; border:1px solid var(--line); border-radius:12px; padding:1.08rem 1.2rem; margin:.8rem 0 1rem; box-shadow:0 1px 1px rgba(16,43,56,.02); }
@@ -878,6 +907,8 @@ div[data-testid='stDataFrame'] { border:1px solid var(--line); border-radius:12p
 div[role='radiogroup'] { background:#e7efee; border-radius:10px; padding:4px; width:fit-content; }
 div[data-baseweb='select'] > div, div[data-baseweb='input'] > div { border-radius:8px; }
 textarea { font-family:'DM Sans','Helvetica Neue',Arial,sans-serif !important; line-height:1.55 !important; }
+[data-testid='stForm'] { padding:1.1rem 1.15rem .4rem; }
+button[kind='secondary'] { background:#fff; }
 </style>""", unsafe_allow_html=True)
 module = st.radio("Modul", ["Penjadwalan Jaga, Review, ERM", "Pembagian Jaga"], horizontal=True, label_visibility="collapsed", key="module")
 if module == "Pembagian Jaga":
