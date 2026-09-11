@@ -771,6 +771,42 @@ def render_roster_intake():
     st.caption("Roster ini adalah sumber pembagian Post-op, Pre-op, dan IGD. Pilot dan Co-pilot akan dipilih dari kelompok yang tersedia saat pembagian, bukan dibaca dari paste. Pengguna biasa tidak dapat mengubah roster.")
 
 
+def render_module_home():
+    st.markdown("""
+    <div class='launch-header'>
+      <div class='launch-mark'>OMFS · CLINICAL OPERATIONS</div>
+      <h1>Resident Duty Desk</h1>
+      <p>Pilih alur kerja untuk menyusun jadwal layanan atau membagi tim jaga harian.</p>
+    </div>
+    """, unsafe_allow_html=True)
+    scheduler_col, division_col = st.columns(2, gap="large")
+    with scheduler_col:
+        st.markdown("""
+        <div class='module-card module-card-schedule'>
+          <div class='module-kicker'>01 · MONTHLY ROSTER</div>
+          <h2>Penjadwalan<br>Jaga, Review, ERM</h2>
+          <p>Susun jadwal periode bulanan atau rentang tanggal dengan fairness Jaga dan Minggu tervalidasi.</p>
+          <div class='module-rule'></div>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.button("Buka Penjadwalan", type="primary", use_container_width=True, key="home_scheduler"):
+            st.session_state.active_module = "scheduler"
+            st.rerun()
+    with division_col:
+        st.markdown("""
+        <div class='module-card module-card-division'>
+          <div class='module-kicker'>02 · DAILY ASSIGNMENT</div>
+          <h2>Pembagian<br>Jaga</h2>
+          <p>Pilih tanggal roster, masukkan pasien, lalu bentuk dan simpan pembagian Post-op, Pre-op, serta IGD.</p>
+          <div class='module-rule'></div>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.button("Buka Pembagian Jaga", use_container_width=True, key="home_division"):
+            st.session_state.active_module = "division"
+            st.rerun()
+    st.caption("Rancangan ringan untuk desktop dan ponsel. Tidak ada data klinis yang ditampilkan pada layar pemilihan ini.")
+
+
 def init_state():
     st.session_state.setdefault("unavailable", {name: set() for name in NAMES})
     st.session_state.setdefault("forbidden", set())
@@ -992,9 +1028,30 @@ div[data-baseweb='select'] > div, div[data-baseweb='input'] > div { border-radiu
 textarea { font-family:'DM Sans','Helvetica Neue',Arial,sans-serif !important; line-height:1.55 !important; }
 [data-testid='stForm'] { padding:1.1rem 1.15rem .4rem; }
 button[kind='secondary'] { background:#fff; }
+.launch-header { position:relative; max-width:760px; margin:8vh auto 2.4rem; text-align:center; animation:soft-in .28s ease-out both; }
+.launch-header:before { content:''; display:block; width:38px; height:38px; margin:0 auto 1.15rem; border:8px solid var(--teal); border-radius:50%; box-shadow:inset 0 0 0 6px var(--paper); }
+.launch-mark, .module-kicker { color:var(--teal); font-family:'Manrope',sans-serif; font-size:.69rem; font-weight:800; letter-spacing:.14em; }
+.launch-header h1 { font-size:3.25rem; line-height:1; margin:.55rem 0 .8rem; }
+.launch-header p { color:var(--muted); font-size:1rem; margin:0 auto; max-width:540px; }
+.module-card { min-height:275px; display:flex; flex-direction:column; background:#fff; border:1px solid var(--line); border-radius:18px; padding:1.55rem; margin-bottom:.75rem; box-shadow:0 1px 2px rgba(16,43,56,.02); animation:soft-in .32s ease-out both; transition:transform .18s ease, border-color .18s ease, box-shadow .18s ease; }
+.module-card:hover { transform:translateY(-3px); border-color:#95bebb; box-shadow:0 14px 30px rgba(16,43,56,.08); }
+.module-card-division { animation-delay:.06s; }
+.module-card h2 { font-size:1.7rem; line-height:1.08; margin:1.5rem 0 .8rem; }
+.module-card p { color:var(--muted); font-size:.94rem; line-height:1.55; margin:0; max-width:390px; }
+.module-rule { width:54px; height:3px; background:var(--gold); margin-top:auto; }
+@keyframes soft-in { from { opacity:0; transform:translateY(7px); } to { opacity:1; transform:translateY(0); } }
+@media (max-width:700px) { .block-container { padding:1.15rem 1rem 3rem; } .launch-header { margin:4vh auto 1.7rem; } .launch-header h1 { font-size:2.45rem; } .module-card { min-height:225px; padding:1.3rem; } .masthead { padding:1.25rem; } .masthead:before { right:1.1rem; top:1rem; font-size:1.7rem; } .masthead h1 { font-size:1.8rem; } }
 </style>""", unsafe_allow_html=True)
-module = st.radio("Modul", ["Penjadwalan Jaga, Review, ERM", "Pembagian Jaga"], horizontal=True, label_visibility="collapsed", key="module")
-if module == "Pembagian Jaga":
+active_module = st.session_state.get("active_module")
+if active_module is None:
+    render_module_home()
+    st.stop()
+nav_left, nav_right = st.columns([5, 1])
+with nav_right:
+    if st.button("Pilih menu lain", key="choose_other_module", use_container_width=True):
+        st.session_state.pop("active_module", None)
+        st.rerun()
+if active_module == "division":
     render_roster_intake()
     st.stop()
 st.markdown("<div class='masthead'><div class='service-line'>DEPARTEMEN BEDAH MULUT & MAKSILOFASIAL • ANGKATAN 15</div><h1>Clinical Duty Roster</h1><p>Susun Jaga, Review, dan ERM dengan distribusi yang tervalidasi. Fairness total dan hari Minggu dikunci sebelum jadwal dapat diekspor.</p></div>", unsafe_allow_html=True)
