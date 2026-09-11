@@ -31,14 +31,16 @@ DOCTOR_WORDS = {"drg", "dr", "sp", "mmf", "mf", "subsp", "comf", "tr", "tm", "ma
 
 
 def default_cohort_config():
-    """Default only. Admin can add, remove, rename, or change each row before parsing."""
+    """Neutral source rows. Admin names them after seeing the pasted roster."""
     return pd.DataFrame([
-        {"Kolom": "a12", "Label angkatan": "Angkatan 12", "Residen per hari": 1, "Aktif": True},
-        {"Kolom": "a13", "Label angkatan": "Angkatan 13", "Residen per hari": 2, "Aktif": True},
-        {"Kolom": "a14", "Label angkatan": "Angkatan 14", "Residen per hari": 3, "Aktif": True},
-        {"Kolom": "a15", "Label angkatan": "Angkatan 15", "Residen per hari": 4, "Aktif": True},
-        {"Kolom": "a16", "Label angkatan": "Angkatan 16", "Residen per hari": 5, "Aktif": True},
-        {"Kolom": "a17", "Label angkatan": "Angkatan 17", "Residen per hari": 5, "Aktif": True},
+        {"Kolom": "kelompok_1", "Label angkatan": "Kelompok 1", "Residen per hari": 1, "Aktif": True},
+        {"Kolom": "kelompok_2", "Label angkatan": "Kelompok 2", "Residen per hari": 1, "Aktif": True},
+        {"Kolom": "kelompok_3", "Label angkatan": "Kelompok 3", "Residen per hari": 1, "Aktif": True},
+        {"Kolom": "kelompok_4", "Label angkatan": "Kelompok 4", "Residen per hari": 2, "Aktif": True},
+        {"Kolom": "kelompok_5", "Label angkatan": "Kelompok 5", "Residen per hari": 3, "Aktif": True},
+        {"Kolom": "kelompok_6", "Label angkatan": "Kelompok 6", "Residen per hari": 4, "Aktif": True},
+        {"Kolom": "kelompok_7", "Label angkatan": "Kelompok 7", "Residen per hari": 5, "Aktif": True},
+        {"Kolom": "kelompok_8", "Label angkatan": "Kelompok 8", "Residen per hari": 5, "Aktif": True},
     ])
 
 
@@ -95,7 +97,7 @@ def parse_pasted_roster(text, config):
             continue
 
         stream = roster_words(" ".join(lines[operational_start:]))
-        required = column_count * (2 + sum(size for _, size in definitions))
+        required = column_count * sum(size for _, size in definitions)
         if len(stream) < required:
             skipped.extend(dates)
             warnings.append(f"Blok {block_number}: roster hanya memiliki {len(stream)} nama, sedangkan konfigurasi membutuhkan {required}. Blok tidak dipetakan.")
@@ -103,16 +105,14 @@ def parse_pasted_roster(text, config):
 
         doctors_text = " ".join(lines[date_line + 1:operational_start])
         doctor_parts = [clean_sentence(item) for item in re.split(r"(?i)(?=(?:dr\.\s*)?drg\.)", doctors_text) if re.search(r"(?i)(?:dr\.\s*)?drg\.", item)]
-        provisional, position = {}, 2 * column_count
+        provisional, position = {}, 0
         for code, size in definitions:
             provisional[code] = stream[position:position + column_count * size]
             position += column_count * size
         blocks.append({
             "dates": dates,
             "count": column_count,
-            "pilot": stream[:column_count],
-            "copilot": stream[column_count:2 * column_count],
-            "tail": stream[2 * column_count:],
+            "tail": stream,
             "provisional": provisional,
             "doctors": doctor_parts,
         })
@@ -153,8 +153,6 @@ def parse_pasted_roster(text, config):
             item = {
                 "Tanggal": datetime.strptime(raw_date, "%d/%m/%Y").date().isoformat(),
                 "DPJP": block["doctors"][index] if len(block["doctors"]) == count else "",
-                "Pilot": block["pilot"][index],
-                "Co-pilot": block["copilot"][index],
             }
             for code, size in definitions:
                 people = groups[code][index * size:(index + 1) * size]
@@ -262,7 +260,7 @@ def admin_access():
 
 
 def render_roster_intake():
-    st.markdown("<div class='masthead'><div class='service-line'>DEPARTEMEN BEDAH MULUT & MAKSILOFASIAL</div><h1>Pembagian Jaga</h1><p>Roster disimpan per bulan. Pengguna cukup memilih bulan dan memakai roster yang telah disahkan admin.</p></div>", unsafe_allow_html=True)
+    st.markdown("<div class='masthead'><div class='service-line'>DEPARTEMEN BEDAH MULUT & MAKSILOFASIAL</div><h1>Pembagian Jaga</h1><p>Roster disimpan per bulan. Data paste dibaca sebagai kelompok angkatan murni; Pilot dan Co-pilot dipilih kemudian saat pembagian.</p></div>", unsafe_allow_html=True)
     today = date.today()
     month_col, year_col = st.columns([2, 1])
     with month_col:
@@ -282,7 +280,7 @@ def render_roster_intake():
     parsed = st.session_state.get("parsed_roster")
 
     if is_admin:
-        st.markdown("<div class='panel'><b>Konfigurasi angkatan</b><br><span style='color:#60717d'>Kolom dan jumlah residen per hari dapat ditambah, dikurangi, atau diubah oleh admin.</span></div>", unsafe_allow_html=True)
+        st.markdown("<div class='panel'><b>Konfigurasi angkatan</b><br><span style='color:#60717d'>Awalnya data bernama Kelompok 1–8. Ubah labelnya menjadi angkatan yang benar, serta tambahkan atau kurangi baris bila format sumber berubah.</span></div>", unsafe_allow_html=True)
         config = st.data_editor(
             config,
             num_rows="dynamic",
@@ -332,7 +330,7 @@ def render_roster_intake():
     metrics[0].metric("Tanggal terbaca", len(shown))
     metrics[1].metric("Angkatan aktif", len(labels))
     metrics[2].metric("Butuh koreksi", len(st.session_state.get("roster_skipped", [])))
-    st.caption("Roster ini adalah sumber pembagian Post-op, Pre-op, dan IGD. Pengguna biasa tidak dapat mengubahnya.")
+    st.caption("Roster ini adalah sumber pembagian Post-op, Pre-op, dan IGD. Pilot dan Co-pilot akan dipilih dari kelompok yang tersedia saat pembagian, bukan dibaca dari paste. Pengguna biasa tidak dapat mengubah roster.")
 
 
 def init_state():
