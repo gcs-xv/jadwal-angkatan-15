@@ -807,6 +807,36 @@ def render_module_home():
     st.caption("Rancangan ringan untuk desktop dan ponsel. Tidak ada data klinis yang ditampilkan pada layar pemilihan ini.")
 
 
+@st.dialog("Akses khusus sekretaris")
+def show_secretary_notice():
+    st.error("Password tidak sesuai.")
+    st.markdown("Minta sekretaris yang bagi jadwalnya.")
+    if st.button("Mengerti", key="dismiss_secretary_notice", use_container_width=True):
+        st.rerun()
+
+
+def scheduler_access_gate():
+    if st.session_state.get("scheduler_access", False):
+        return True
+    st.markdown("""
+    <div class='launch-header'>
+      <div class='launch-mark'>SECRETARY ACCESS</div>
+      <h1>Penjadwalan layanan</h1>
+      <p>Penjadwalan Jaga, Review, dan ERM dikelola oleh sekretaris angkatan.</p>
+    </div>
+    """, unsafe_allow_html=True)
+    with st.container(border=True):
+        password = st.text_input("Password sekretaris", type="password", key="scheduler_password")
+        if st.button("Masuk ke penjadwalan", type="primary", use_container_width=True, key="scheduler_login"):
+            expected = app_secret("SCHEDULER_PASSWORD") or "rachel"
+            if password == expected:
+                st.session_state.scheduler_access = True
+                st.rerun()
+            else:
+                show_secretary_notice()
+    return False
+
+
 def init_state():
     st.session_state.setdefault("unavailable", {name: set() for name in NAMES})
     st.session_state.setdefault("forbidden", set())
@@ -1047,12 +1077,19 @@ if active_module is None:
     render_module_home()
     st.stop()
 nav_left, nav_right = st.columns([5, 1])
+with nav_left:
+    if active_module == "scheduler" and st.session_state.get("scheduler_access", False):
+        if st.button("Kunci akses sekretaris", key="scheduler_logout"):
+            st.session_state.scheduler_access = False
+            st.rerun()
 with nav_right:
     if st.button("Pilih menu lain", key="choose_other_module", use_container_width=True):
         st.session_state.pop("active_module", None)
         st.rerun()
 if active_module == "division":
     render_roster_intake()
+    st.stop()
+if not scheduler_access_gate():
     st.stop()
 st.markdown("<div class='masthead'><div class='service-line'>DEPARTEMEN BEDAH MULUT & MAKSILOFASIAL • ANGKATAN 15</div><h1>Clinical Duty Roster</h1><p>Susun Jaga, Review, dan ERM dengan distribusi yang tervalidasi. Fairness total dan hari Minggu dikunci sebelum jadwal dapat diekspor.</p></div>", unsafe_allow_html=True)
 
